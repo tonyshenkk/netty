@@ -91,9 +91,7 @@ abstract class DnsNameResolverContext<T> {
     private final DnsNameResolver parent;
     private final DnsServerAddressStream nameServerAddrs;
     private final String hostname;
-    protected String pristineHostname;
     private final DnsCache resolveCache;
-    private final boolean traceEnabled;
     private final int maxAllowedQueries;
     private final InternetProtocolFamily[] resolvedInternetProtocolFamilies;
     private final DnsRecord[] additionals;
@@ -103,15 +101,14 @@ abstract class DnsNameResolverContext<T> {
                     new IdentityHashMap<Future<AddressedEnvelope<DnsResponse, InetSocketAddress>>, Boolean>());
 
     private List<DnsCacheEntry> resolvedEntries;
-    private StringBuilder trace;
     private int allowedQueries;
     private boolean triedCNAME;
 
-    protected DnsNameResolverContext(DnsNameResolver parent,
-                                     String hostname,
-                                     DnsRecord[] additionals,
-                                     DnsCache resolveCache,
-                                     DnsServerAddressStream nameServerAddrs) {
+    DnsNameResolverContext(DnsNameResolver parent,
+                           String hostname,
+                           DnsRecord[] additionals,
+                           DnsCache resolveCache,
+                           DnsServerAddressStream nameServerAddrs) {
         this.parent = parent;
         this.hostname = hostname;
         this.additionals = additionals;
@@ -120,50 +117,58 @@ abstract class DnsNameResolverContext<T> {
         this.nameServerAddrs = ObjectUtil.checkNotNull(nameServerAddrs, "nameServerAddrs");
         maxAllowedQueries = parent.maxQueriesPerResolve();
         resolvedInternetProtocolFamilies = parent.resolvedInternetProtocolFamiliesUnsafe();
-        traceEnabled = parent.isTraceEnabled();
         allowedQueries = maxAllowedQueries;
     }
 
-    void resolve(Promise<T> promise) {
-        boolean directSearch = parent.searchDomains().length == 0 || StringUtil.endsWith(hostname, '.');
-        if (directSearch) {
+    void resolve(final Promise<T> promise) {
+        if (parent.searchDomains().length == 0 || parent.ndots() == 0 || StringUtil.endsWith(hostname, '.')) {
             internalResolve(promise);
         } else {
-            final Promise<T> original = promise;
-            promise = parent.executor().newPromise();
-            promise.addListener(new FutureListener<T>() {
-                int count;
+            int dots = 0;
+            for (int idx = hostname.length() - 1; idx >= 0; idx--) {
+                if (hostname.charAt(idx) == '.' && ++dots >= parent.ndots()) {
+                    internalResolve(promise);
+                    return;
+                }
+            }
+
+            doSearchDomainQuery(0, new FutureListener<T>() {
+                private int count = 1;
                 @Override
                 public void operationComplete(Future<T> future) throws Exception {
                     if (future.isSuccess()) {
-                        original.trySuccess(future.getNow());
+                        promise.trySuccess(future.getNow());
                     } else if (count < parent.searchDomains().length) {
-                        String searchDomain = parent.searchDomains()[count++];
-                        Promise<T> nextPromise = parent.executor().newPromise();
-                        String nextHostname = hostname + '.' + searchDomain;
-                        DnsNameResolverContext<T> nextContext = newResolverContext(parent,
-                            nextHostname, additionals, resolveCache, nameServerAddrs);
-                        nextContext.pristineHostname = hostname;
-                        nextContext.internalResolve(nextPromise);
-                        nextPromise.addListener(this);
+                        doSearchDomainQuery(count++, this);
                     } else {
-                        original.tryFailure(future.cause());
+                        promise.tryFailure(new SearchDomainUnknownHostException(future.cause(), hostname));
                     }
                 }
             });
-            if (parent.ndots() == 0) {
-                internalResolve(promise);
-            } else {
-                int dots = 0;
-                for (int idx = hostname.length() - 1; idx >= 0; idx--) {
-                    if (hostname.charAt(idx) == '.' && ++dots >= parent.ndots()) {
-                        internalResolve(promise);
-                        return;
-                    }
-                }
-                promise.tryFailure(new UnknownHostException(hostname));
-            }
         }
+    }
+
+    private static final class SearchDomainUnknownHostException extends UnknownHostException {
+        SearchDomainUnknownHostException(Throwable cause, String originalHostname) {
+            super("Search domain query failed. Original hostname: '" + originalHostname + "' " + cause.getMessage());
+            setStackTrace(cause.getStackTrace());
+        }
+
+        @Override
+        public Throwable fillInStackTrace() {
+            return this;
+        }
+    }
+
+    private void doSearchDomainQuery(int count, FutureListener<T> listener) {
+        DnsNameResolverContext<T> nextContext = newResolverContext(parent,
+                                                                   hostname + '.' + parent.searchDomains()[count],
+                                                                   additionals,
+                                                                   resolveCache,
+                                                                   nameServerAddrs);
+        Promise<T> nextPromise = parent.executor().newPromise();
+        nextContext.internalResolve(nextPromise);
+        nextPromise.addListener(listener);
     }
 
     private void internalResolve(Promise<T> promise) {
@@ -302,11 +307,7 @@ abstract class DnsNameResolverContext<T> {
                         onResponse(nameServerAddrStream, question, future.getNow(), queryLifecycleObserver, promise);
                     } else {
                         // Server did not respond or I/O error occurred; try again.
-                        Throwable cause = future.cause();
-                        queryLifecycleObserver.queryFailed(cause);
-                        if (traceEnabled) {
-                            addTrace(cause);
-                        }
+                        queryLifecycleObserver.queryFailed(future.cause());
                         query(nameServerAddrStream, question, promise);
                     }
                 } finally {
@@ -338,12 +339,6 @@ abstract class DnsNameResolverContext<T> {
                     queryLifecycleObserver.queryFailed(UNRECOGNIZED_TYPE_QUERY_FAILED_EXCEPTION);
                 }
                 return;
-            }
-
-            if (traceEnabled) {
-                addTrace(envelope.sender(),
-                         "response code: " + code + " with " + res.count(DnsSection.ANSWER) + " answer(s) and " +
-                         res.count(DnsSection.AUTHORITY) + " authority resource(s)");
             }
 
             // Retry with the next server if the server did not tell us that the domain does not exist.
@@ -400,12 +395,7 @@ abstract class DnsNameResolverContext<T> {
                     addNameServerToCache(authoritativeNameServer, resolved, r.timeToLive());
                 }
 
-                if (nameServers.isEmpty()) {
-                    if (traceEnabled) {
-                        addTrace(envelope.sender(),
-                                 "no matching authoritative name server found in the ADDITIONALS section");
-                    }
-                } else {
+                if (!nameServers.isEmpty()) {
                     query(parent.uncachedRedirectDnsServerStream(nameServers), question,
                           queryLifecycleObserver.queryRedirected(unmodifiableList(nameServers)), promise);
                     return true;
@@ -491,15 +481,11 @@ abstract class DnsNameResolverContext<T> {
             return;
         }
 
-        if (traceEnabled) {
-            addTrace(envelope.sender(), "no matching " + qType + " record found");
-        }
-
         if (cnames.isEmpty()) {
             queryLifecycleObserver.queryFailed(NO_MATCHING_RECORD_QUERY_FAILED_EXCEPTION);
         } else {
             // We asked for A/AAAA but we got only CNAME.
-            onResponseCNAME(question, envelope, cnames, false, queryLifecycleObserver, promise);
+            onResponseCNAME(question, envelope, cnames, queryLifecycleObserver, promise);
         }
     }
 
@@ -528,12 +514,12 @@ abstract class DnsNameResolverContext<T> {
     private void onResponseCNAME(DnsQuestion question, AddressedEnvelope<DnsResponse, InetSocketAddress> envelope,
                                  final DnsQueryLifecycleObserver queryLifecycleObserver,
                                  Promise<T> promise) {
-        onResponseCNAME(question, envelope, buildAliasMap(envelope.content()), true, queryLifecycleObserver, promise);
+        onResponseCNAME(question, envelope, buildAliasMap(envelope.content()), queryLifecycleObserver, promise);
     }
 
     private void onResponseCNAME(
             DnsQuestion question, AddressedEnvelope<DnsResponse, InetSocketAddress> response,
-            Map<String, String> cnames, boolean trace, final DnsQueryLifecycleObserver queryLifecycleObserver,
+            Map<String, String> cnames, final DnsQueryLifecycleObserver queryLifecycleObserver,
             Promise<T> promise) {
 
         // Resolve the host name in the question into the real host name.
@@ -556,9 +542,6 @@ abstract class DnsNameResolverContext<T> {
             followCname(response.sender(), name, resolved, queryLifecycleObserver, promise);
         } else {
             queryLifecycleObserver.queryFailed(CNAME_NOT_FOUND_QUERY_FAILED_EXCEPTION);
-            if (trace && traceEnabled) {
-                addTrace(response.sender(), "no matching CNAME record found");
-            }
         }
     }
 
@@ -663,13 +646,7 @@ abstract class DnsNameResolverContext<T> {
         final int tries = maxAllowedQueries - allowedQueries;
         final StringBuilder buf = new StringBuilder(64);
 
-        buf.append("failed to resolve '");
-        if (pristineHostname != null) {
-          buf.append(pristineHostname);
-        } else {
-          buf.append(hostname);
-        }
-        buf.append('\'');
+        buf.append("failed to resolve '").append(hostname).append('\'');
         if (tries > 1) {
             if (tries < maxAllowedQueries) {
                 buf.append(" after ")
@@ -680,10 +657,6 @@ abstract class DnsNameResolverContext<T> {
                 .append(maxAllowedQueries)
                 .append(' ');
             }
-        }
-        if (trace != null) {
-            buf.append(':')
-               .append(trace);
         }
         final UnknownHostException cause = new UnknownHostException(buf.toString());
 
@@ -718,21 +691,6 @@ abstract class DnsNameResolverContext<T> {
     private void followCname(InetSocketAddress nameServerAddr, String name, String cname,
                              final DnsQueryLifecycleObserver queryLifecycleObserver,
                              Promise<T> promise) {
-
-        if (traceEnabled) {
-            if (trace == null) {
-                trace = new StringBuilder(128);
-            }
-
-            trace.append(StringUtil.NEWLINE);
-            trace.append("\tfrom ");
-            trace.append(nameServerAddr);
-            trace.append(": ");
-            trace.append(name);
-            trace.append(" CNAME ");
-            trace.append(cname);
-        }
-
         // Use the same server for both CNAME queries
         DnsServerAddressStream stream = DnsServerAddresses.singleton(getNameServers(cname).next()).stream();
 
@@ -776,37 +734,8 @@ abstract class DnsNameResolverContext<T> {
             return new DefaultDnsQuestion(hostname, type);
         } catch (IllegalArgumentException e) {
             // java.net.IDN.toASCII(...) may throw an IllegalArgumentException if it fails to parse the hostname
-            if (traceEnabled) {
-                addTrace(e);
-            }
             return null;
         }
-    }
-
-    private void addTrace(InetSocketAddress nameServerAddr, String msg) {
-        assert traceEnabled;
-
-        if (trace == null) {
-            trace = new StringBuilder(128);
-        }
-
-        trace.append(StringUtil.NEWLINE);
-        trace.append("\tfrom ");
-        trace.append(nameServerAddr);
-        trace.append(": ");
-        trace.append(msg);
-    }
-
-    private void addTrace(Throwable cause) {
-        assert traceEnabled;
-
-        if (trace == null) {
-            trace = new StringBuilder(128);
-        }
-
-        trace.append(StringUtil.NEWLINE);
-        trace.append("Caused by: ");
-        trace.append(cause);
     }
 
     /**

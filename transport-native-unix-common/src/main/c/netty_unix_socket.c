@@ -26,6 +26,7 @@
 #include <netinet/tcp.h>
 
 #include "netty_unix_errors.h"
+#include "netty_unix_jni.h"
 #include "netty_unix_socket.h"
 #include "netty_unix_util.h"
 
@@ -581,7 +582,7 @@ static jint netty_unix_socket_connectDomainSocket(JNIEnv* env, jclass clazz, jin
 static jint netty_unix_socket_recvFd(JNIEnv* env, jclass clazz, jint fd) {
     int socketFd;
     struct msghdr descriptorMessage = { 0 };
-    struct iovec iov[1] = { 0 };
+    struct iovec iov[1] = { { 0 } };
     char control[CMSG_SPACE(sizeof(int))] = { 0 };
     char iovecData[1];
 
@@ -629,7 +630,7 @@ static jint netty_unix_socket_recvFd(JNIEnv* env, jclass clazz, jint fd) {
 
 static jint netty_unix_socket_sendFd(JNIEnv* env, jclass clazz, jint socketFd, jint fd) {
     struct msghdr descriptorMessage = { 0 };
-    struct iovec iov[1] = { 0 };
+    struct iovec iov[1] = { { 0 } };
     char control[CMSG_SPACE(sizeof(int))] = { 0 };
     char iovecData[1];
 
@@ -974,7 +975,7 @@ jint netty_unix_socket_JNI_OnLoad(JNIEnv* env, const char* packagePrefix) {
     free(mem);
 
     socketType = socket_type(env);
-    return JNI_VERSION_1_6;
+    return NETTY_JNI_VERSION;
 }
 
 void netty_unix_socket_JNI_OnUnLoad(JNIEnv* env) {
